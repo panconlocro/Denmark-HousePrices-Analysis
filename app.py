@@ -71,9 +71,8 @@ def load_models():
     """Carga los modelos entrenados"""
     models = {}
     try:
-        models['XGBoost'] = joblib.load('models/xgb_cpu.pkl')
         models['RandomForest'] = joblib.load('models/rf.pkl')
-        models['Ridge'] = joblib.load('models/ridge.pkl')
+        models['XGBoost'] = joblib.load('models/xgb_cpu.pkl')
         models['FLAML AutoML'] = joblib.load('models/flaml_automl.pkl')
     except Exception as e:
         st.error(f"Error cargando modelos: {e}")
@@ -87,8 +86,9 @@ def load_train_data():
         train = pd.read_parquet('data/processed/train_data.parquet')
         selected_features = open('data/processed/selected_features.txt').read().splitlines()
         
-        exclude_features = ['log_price', 'quarter', 'region_count', 'price_deviation_from_median', 
-                           'time_trend', 'region_target_encoded', 'region_count']
+        # Excluir features que el modelo no usa (fueron excluidas en el entrenamiento)
+        exclude_features = ['log_price', 'price_deviation_from_median', 'time_trend', 
+                           'quarter', 'region_count', 'region_target_encoded']
         features = [f for f in selected_features if f not in exclude_features]
         
         return train, features
@@ -97,72 +97,122 @@ def load_train_data():
         return None, None
 
 
-def create_features(date, region, house_type, sales_type, sqm, no_rooms, year_build):
+@st.cache_resource
+def load_region_statistics():
+    """Carga estadísticas por región precalculadas del entrenamiento"""
+    try:
+        import json
+        with open('data/processed/region_statistics.json', 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Error cargando estadísticas regionales: {e}")
+        return None
+
+
+def create_features(date, region, house_type, sales_type, sqm, no_rooms, year_build, region_stats):
     """
-    Genera todas las features necesarias a partir de los inputs del usuario
+    Genera todas las features necesarias a partir de los inputs del usuario.
+    Usa estadísticas reales del dataset de entrenamiento.
+    
+    Args:
+        date: Fecha de la venta
+        region: Región de la propiedad
+        house_type: Tipo de casa
+        sales_type: Tipo de venta
+        sqm: Área en metros cuadrados
+        no_rooms: Número de habitaciones
+        year_build: Año de construcción
+        region_stats: Diccionario con estadísticas por región
     """
-    # Fecha y temporales
+    # === FECHA Y TEMPORALES ===
     dt = pd.to_datetime(date)
     year = dt.year
     month = dt.month
     quarter = (month - 1) // 3 + 1
     
-    # Features temporales
+    # Features temporales cíclicas
     month_sin = np.sin(2 * np.pi * month / 12)
     month_cos = np.cos(2 * np.pi * month / 12)
     quarter_sin = np.sin(2 * np.pi * quarter / 4)
     quarter_cos = np.cos(2 * np.pi * quarter / 4)
     
-    # Features de tamaño
-    price_per_sqm = 0  # Placeholder, se calcula después
-    rooms_sqm_ratio = no_rooms / sqm if sqm > 0 else 0
-    
-    # Edad de la propiedad
+    # === EDAD DE LA PROPIEDAD ===
     property_age = year - year_build
     
-    # Features categóricas (se codificarán como one-hot)
+    # === FEATURES GEOGRÁFICAS (desde estadísticas reales) ===
+    if region in region_stats:
+        region_price_mean = region_stats[region]['region_price_mean']
+        region_frequency = region_stats[region]['region_frequency']
+    else:
+        # Fallback a media global
+        region_price_mean = region_stats['_global']['global_mean']
+        region_frequency = 0
+    
+    # === FEATURES DE PRECIO ESTIMADAS ===
+    # Usamos la media regional como base para estimar price_per_sqm
+    estimated_price_per_sqm = region_price_mean / sqm if sqm > 0 else 0
+    price_per_sqm = estimated_price_per_sqm
+    
+    # === CATEGORÍAS DE PRECIO ===
+    # Las categorías se basan en cuartiles del precio
+    # Premium: > p75, High: p50-p75, Medium: p25-p50
+    estimated_price = region_price_mean  # Primera estimación
+    
+    # Categorías basadas en percentiles globales aproximados
+    global_p75 = region_stats['_global']['global_mean'] * 1.5  # Aproximación
+    global_p50 = region_stats['_global']['global_mean']
+    global_p25 = region_stats['_global']['global_mean'] * 0.6
+    
+    price_category_Premium = 1 if estimated_price > global_p75 else 0
+    price_category_High = 1 if global_p50 < estimated_price <= global_p75 else 0
+    price_category_Medium = 1 if global_p25 < estimated_price <= global_p50 else 0
+    
+    # === FEATURES CATEGÓRICAS ===
+    # Sales type
+    sales_type_regular_sale = 1 if sales_type == 'regular_sale' else 0
+    sales_type_family_sale = 1 if sales_type == 'family_sale' else 0
+    
+    # House type
+    house_type_Summerhouse = 1 if house_type == 'Summerhouse' else 0
     is_premium = 1 if house_type == 'Villa' else 0
     
-    # Interacciones básicas
+    # === INTERACCIONES ===
+    rooms_sqm_ratio = no_rooms / sqm if sqm > 0 else 0
     age_x_villa = property_age * is_premium
+    sqm_x_region = sqm * region_frequency / 100000  # Normalizado
+    price_per_sqm_x_region = price_per_sqm * region_frequency / 100000
     
-    # Features geográficas sintéticas (simplificadas)
-    # En producción, estos valores vendrían de un mapeo region -> características
-    region_frequency = 0  # Se calculará del dataset
-    region_price_mean = 0  # Se calculará del dataset
-    sqm_x_region = sqm * hash(region) % 100 / 100  # Proxy simple
-    price_per_sqm_x_region = 0  # Se calculará después
+    # === FASES DE MERCADO ===
+    phase_growth_90s = 1 if 1990 <= year <= 2000 else 0
+    phase_covid_era = 1 if 2020 <= year <= 2024 else 0
     
-    # Categorías de precio (se asignarán después de la predicción inicial)
-    price_category_Premium = 0
-    price_category_High = 0
-    price_category_Medium = 0
-    
-    # Sales type
-    sales_type_regular_sale = 1 if sales_type == 'Regular Sale' else 0
-    
-    # Crear DataFrame con todas las features
+    # Crear DataFrame SOLO con las features que el modelo usa (24 features)
+    # EXCLUIDAS: log_price, price_deviation_from_median, time_trend, quarter, region_count, region_target_encoded
     features = {
-        'year': year,
         'month_sin': month_sin,
         'month_cos': month_cos,
         'quarter_sin': quarter_sin,
         'quarter_cos': quarter_cos,
-        'sqm': sqm,
-        'no_rooms': no_rooms,
-        'property_age': property_age,
         'price_per_sqm': price_per_sqm,
-        'rooms_sqm_ratio': rooms_sqm_ratio,
+        'price_category_Premium': price_category_Premium,
+        'price_category_Medium': price_category_Medium,
+        'price_per_sqm_x_region': price_per_sqm_x_region,
+        'price_category_High': price_category_High,
         'is_premium': is_premium,
+        'year': year,
+        'phase_growth_90s': phase_growth_90s,
+        'region_price_mean': region_price_mean,
+        'property_age': property_age,
+        'phase_covid_era': phase_covid_era,
+        'sqm': sqm,
+        'sales_type_regular_sale': sales_type_regular_sale,
         'age_x_villa': age_x_villa,
         'region_frequency': region_frequency,
-        'region_price_mean': region_price_mean,
+        'sales_type_family_sale': sales_type_family_sale,
         'sqm_x_region': sqm_x_region,
-        'price_per_sqm_x_region': price_per_sqm_x_region,
-        'price_category_Premium': price_category_Premium,
-        'price_category_High': price_category_High,
-        'price_category_Medium': price_category_Medium,
-        'sales_type_regular_sale': sales_type_regular_sale
+        'rooms_sqm_ratio': rooms_sqm_ratio,
+        'house_type_Summerhouse': house_type_Summerhouse,
+        'no_rooms': no_rooms
     }
     
     return pd.DataFrame([features])
@@ -202,26 +252,24 @@ def main():
     st.markdown('<h1 class="main-header">Denmark Housing Price Predictor</h1>', unsafe_allow_html=True)
     
     st.markdown("""
-    Esta aplicación predice el precio de propiedades en Dinamarca usando **4 modelos** de Machine Learning:
-    - **XGBoost** (Gradient Boosting optimizado)
-    - **RandomForest** (Ensamble de árboles de decisión)
-    - **Ridge Regression** (Modelo lineal con regularización L2)
-    - **FLAML AutoML** (Optimización automática de modelos)
+    Esta aplicación predice el precio de propiedades en Dinamarca usando **3 modelos** de Machine Learning:
+    - **RandomForest**: Ensamble de árboles de decisión (RMSE: 38,812 DKK - Mejor modelo)
+    - **XGBoost**: Gradient Boosting optimizado (RMSE: 81,000 DKK)
+    - **FLAML AutoML**: Optimización automática de modelos (RMSE: 64,000 DKK)
     """)
     
-    # Cargar modelos y datos
-    with st.spinner('Cargando modelos...'):
+    # Cargar modelos, datos y estadísticas
+    with st.spinner('Cargando modelos y estadísticas...'):
         models = load_models()
         train_data, feature_names = load_train_data()
+        region_stats = load_region_statistics()
     
-    if not models or train_data is None:
+    if not models or train_data is None or region_stats is None:
         st.error("No se pudieron cargar los modelos o datos necesarios.")
         return
     
-    # Preparar scaler
-    exclude_features = ['log_price', 'quarter', 'region_count', 'price_deviation_from_median', 
-                       'time_trend', 'region_target_encoded', 'region_count']
-    features = [f for f in feature_names if f not in exclude_features]
+    # Preparar scaler (las features ya vienen filtradas)
+    features = feature_names
     X_train = train_data[features]
     scaler = StandardScaler().fit(X_train)
     
@@ -241,17 +289,20 @@ def main():
         max_value=datetime(2030, 12, 31)
     )
     
-    # Región
-    regions = ['Capital Region', 'Zealand', 'Southern Denmark', 'Central Jutland', 'North Jutland']
+    # Región (regiones reales del dataset)
+    regions = ['Zealand', 'Jutland', 'Fyn & islands', 'Bornholm']
     region = st.sidebar.selectbox("Región", regions)
     
-    # Tipo de casa
-    house_types = ['Apartment', 'Terraced house', 'Villa', 'Semi-detached house']
+    # Tipo de casa (tipos reales del dataset)
+    house_types = ['Apartment', 'Villa', 'Townhouse', 'Summerhouse', 'Farm']
     house_type = st.sidebar.selectbox("Tipo de propiedad", house_types)
     
-    # Tipo de venta
-    sales_types = ['Regular Sale', 'Foreclosure', 'Other']
-    sales_type = st.sidebar.selectbox("Tipo de venta", sales_types)
+    # Tipo de venta (tipos reales del dataset)
+    sales_types = ['regular_sale', 'family_sale', 'other_sale', 'auction']
+    sales_type_display = {'regular_sale': 'Regular Sale', 'family_sale': 'Family Sale', 
+                         'other_sale': 'Other Sale', 'auction': 'Auction'}
+    sales_type = st.sidebar.selectbox("Tipo de venta", sales_types, 
+                                      format_func=lambda x: sales_type_display[x])
     
     # Características numéricas
     st.sidebar.subheader("Características")
@@ -268,13 +319,18 @@ def main():
     
     if predict_button:
         with st.spinner('Generando predicciones...'):
-            # Generar features
-            features_df = create_features(date, region, house_type, sales_type, sqm, no_rooms, year_build)
+            # Generar features con estadísticas reales
+            features_df = create_features(date, region, house_type, sales_type, sqm, no_rooms, year_build, region_stats)
             
-            # Alinear features con el modelo
+            # Alinear features con el modelo (deben estar todas las features requeridas)
+            # Primero, asegurar que tenemos todas las features en el orden correcto
             missing_features = set(features) - set(features_df.columns)
-            for feat in missing_features:
-                features_df[feat] = 0
+            if missing_features:
+                st.warning(f"Features faltantes (se llenarán con 0): {missing_features}")
+                for feat in missing_features:
+                    features_df[feat] = 0
+            
+            # Ordenar columnas según el modelo
             features_df = features_df[features]
             
             # Hacer predicciones
@@ -294,8 +350,11 @@ def main():
             st.metric("Año construcción", year_build)
             st.metric("Edad", date.year - year_build)
         with col4:
-            st.metric("Tipo de venta", sales_type)
-            st.metric("Precio/m²", f"~{predictions['RandomForest']['price_dkk']/sqm:,.0f} DKK")
+            st.metric("Tipo de venta", sales_type_display.get(sales_type, sales_type))
+            # Usar el primer modelo disponible para mostrar precio/m²
+            first_model = list(predictions.values())[0] if predictions else None
+            if first_model:
+                st.metric("Precio/m²", f"~{first_model['price_dkk']/sqm:,.0f} DKK")
         
         st.markdown("---")
         
@@ -318,14 +377,24 @@ def main():
             """, unsafe_allow_html=True)
             
             # Predicciones individuales
-            cols = st.columns(4)
+            cols = st.columns(3)
             for idx, (name, pred) in enumerate(predictions.items()):
                 with cols[idx]:
+                    # Destacar RandomForest como mejor modelo
+                    extra_info = ""
+                    if name == "RandomForest":
+                        extra_info = '<p style="color: #28a745; font-weight: bold;">Mejor modelo (RMSE: 38,812 DKK)</p>'
+                    elif name == "XGBoost":
+                        extra_info = '<p style="color: #17a2b8;">RMSE: 81,000 DKK</p>'
+                    elif name == "FLAML AutoML":
+                        extra_info = '<p style="color: #6610f2;">RMSE: 64,000 DKK</p>'
+                    
                     st.markdown(f"""
                     <div class="metric-card">
                         <h3>{name}</h3>
                         <h2>{pred['price_dkk']:,.0f} DKK</h2>
                         <p>{pred['price_millions']:.2f}M DKK</p>
+                        {extra_info}
                     </div>
                     """, unsafe_allow_html=True)
         
@@ -340,9 +409,9 @@ def main():
                 go.Bar(
                     x=model_names,
                     y=prices,
-                    text=[f'{p/1e3:.0f}k' for p in prices],
+                    text=[f'{p/1e6:.2f}M DKK' for p in prices],
                     textposition='auto',
-                    marker_color=['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728']
+                    marker_color=['#28a745', '#17a2b8', '#6610f2']  # Verde, Azul, Morado
                 )
             ])
             
@@ -379,17 +448,29 @@ def main():
             st.markdown("""
             **Información de los Modelos:**
             
-            - **RandomForest**: Ensamble de 400 árboles, `max_depth=None`, `min_samples_leaf=2`
-            - **XGBoost**: 300 árboles, `learning_rate=0.05`, `tree_method=hist` (CPU optimizado)
-            - **Ridge**: Regresión lineal con regularización L2, `alpha=10.0`
-            - **FLAML AutoML**: Optimización automática con presupuesto de 600s
+            **RandomForest** (Mejor modelo)
+            - Ensamble de 400 árboles de decisión
+            - Configuración: `max_depth=None`, `min_samples_leaf=2`
+            - **RMSE: 38,812 DKK** (Modelo más preciso)
+            - Fortaleza: Captura relaciones no lineales complejas
+            
+            **XGBoost**
+            - 300 árboles con Gradient Boosting
+            - Configuración: `learning_rate=0.05`, `tree_method=hist` (CPU optimizado)
+            - **RMSE: 81,000 DKK**
+            - Fortaleza: Rápido y eficiente para datasets grandes
+            
+            **FLAML AutoML**
+            - Optimización automática de hiperparámetros
+            - Presupuesto de tiempo: 600 segundos
+            - **RMSE: 64,000 DKK**
+            - Fortaleza: Encuentra el mejor modelo automáticamente
+            
+            ---
             
             **Target**: `log_price` (logaritmo del precio de compra)
             
-            **Métricas en test set (613k muestras):**
-            - RandomForest RMSE: 38,812 DKK
-            - XGBoost RMSE: ~81,000 DKK
-            - FLAML RMSE: ~64,000 DKK
+            **Dataset**: 613k muestras de test (2018-2024)
             """)
     
     else:
@@ -406,7 +487,7 @@ def main():
         with col3:
             st.metric("Periodo", "1992-2017")
         with col4:
-            st.metric("Regiones", "5")
+            st.metric("Regiones", "4")
 
 
 if __name__ == "__main__":
